@@ -365,6 +365,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_CLOSE => {
             crate::xlog_info!("XCL window closed – ending the game process");
+            super::pipeline_library::save(true);
             crate::report::write_final(None);
             crate::log::flush();
             windows::Win32::System::Threading::ExitProcess(0);
@@ -1216,6 +1217,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         return;
     }
     p.last = Instant::now();
+    super::pipeline_library::save(false);
     if !p.dumps.is_empty() {
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
             Ok(()) => {
