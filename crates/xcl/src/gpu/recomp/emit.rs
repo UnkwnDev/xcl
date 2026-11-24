@@ -2771,8 +2771,8 @@ impl Em {
                 h(1, true),
                 src(2)
             )),
-            "v_dot4_u32_u8" if clamp => Some(format!("sat_u32((uint64_t)dot4_u8({}, {}, 0u) + (uint64_t){})", src(0), src(1), src(2))),
-            "v_dot4_i32_i8" if clamp => Some(format!("sat_i32((int64_t)(int)dot4_i8({}, {}, 0u) + (int64_t)(int){})", src(0), src(1), src(2))),
+            "v_dot4_u32_u8" if clamp => Some(format!("sat_u32((uint64_t)dot4add_u8packed({}, {}, 0u) + (uint64_t){})", src(0), src(1), src(2))),
+            "v_dot4_i32_i8" if clamp => Some(format!("sat_i32((int64_t)(int)dot4add_i8packed({}, {}, 0) + (int64_t)(int){})", src(0), src(1), src(2))),
             "v_dot8_u32_u4" if clamp => Some(format!("sat_u32((uint64_t)dot8_u4({}, {}, 0u) + (uint64_t){})", src(0), src(1), src(2))),
             "v_dot8_i32_i4" if clamp => Some(format!("sat_i32((int64_t)(int)dot8_i4({}, {}, 0u) + (int64_t)(int){})", src(0), src(1), src(2))),
             "v_dot2_i32_i16" => Some(format!("(uint)({} * {} + {} * {} + (int){})", si(0, false), si(1, false), si(0, true), si(1, true), src(2))),
