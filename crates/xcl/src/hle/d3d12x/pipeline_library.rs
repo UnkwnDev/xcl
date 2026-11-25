@@ -280,6 +280,7 @@ static PENDING_ADDED: AtomicU64 = AtomicU64::new(0);
 static LAST_SAVE_MS: AtomicU64 = AtomicU64::new(0);
 static SAVE_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
 static BG_SAVING: AtomicBool = AtomicBool::new(false);
+static SAVE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 const SAVE_EVERY_MS: u64 = 20_000;
 
@@ -322,7 +323,7 @@ fn store_pipeline(name: &str, pso: &ID3D12PipelineState, counter: &AtomicU64) {
         }
     };
     if should_save {
-        save(false);
+        save_async();
     }
 }
 
@@ -376,12 +377,13 @@ pub fn log_summary() {
 }
 
 /// Requests a non-blocking background save when new pipelines are due, so frame
-/// presentation never serializes or writes to disk on the render thread.
+/// presentation and pipeline build threads never serialize or write to disk.
 pub fn save_async() {
     if !save_due(false, current_save_ms()) {
         return;
     }
-    if BG_SAVING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    SAVE_REQUESTED.store(true, Ordering::SeqCst);
+    if BG_SAVING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return;
     }
     if std::thread::Builder::new()
@@ -390,20 +392,41 @@ pub fn save_async() {
             struct Guard;
             impl Drop for Guard {
                 fn drop(&mut self) {
-                    BG_SAVING.store(false, Ordering::Release);
+                    BG_SAVING.store(false, Ordering::SeqCst);
                 }
             }
             let _guard = Guard;
-            save(false);
+            loop {
+                SAVE_REQUESTED.store(false, Ordering::SeqCst);
+                let wrote = save_inner(false);
+                if wrote && SAVE_REQUESTED.load(Ordering::SeqCst) && save_due(false, current_save_ms()) {
+                    continue;
+                }
+                BG_SAVING.store(false, Ordering::SeqCst);
+                // Re-check after clearing BG_SAVING so a request arriving right before
+                // the flag cleared is never stranded when no frame presents follow.
+                if wrote
+                    && SAVE_REQUESTED.load(Ordering::SeqCst)
+                    && save_due(false, current_save_ms())
+                    && BG_SAVING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
         })
         .is_err()
     {
-        BG_SAVING.store(false, Ordering::Release);
+        BG_SAVING.store(false, Ordering::SeqCst);
     }
 }
 
 /// Serializes and writes the library to disk if new pipelines were stored.
 pub fn save(now: bool) {
+    let _ = save_inner(now);
+}
+
+fn save_inner(now: bool) -> bool {
     // Serialize-then-write order must remain monotonic so an earlier snapshot cannot overwrite a newer one.
     static SAVE_IO: Mutex<()> = Mutex::new(());
 
@@ -411,30 +434,30 @@ pub fn save(now: bool) {
         log_summary();
     }
 
-    let (Some(dir), Some(lib_mutex)) = (DIR.get(), library()) else { return };
+    let (Some(dir), Some(lib_mutex)) = (DIR.get(), library()) else { return false };
     // Avoid blocking callers on SAVE_IO when nothing is pending, within throttle, or busy.
     let now_ms = current_save_ms();
     if !save_due(now, now_ms) {
-        return;
+        return false;
     }
     let _io_guard = if now {
         SAVE_IO.lock().unwrap()
     } else {
         match SAVE_IO.try_lock() {
             Ok(g) => g,
-            Err(_) => return,
+            Err(_) => return false,
         }
     };
 
     let blob = {
         let mut l = lib_mutex.lock().unwrap();
         if l.added == 0 {
-            return;
+            return false;
         }
         let batch_ready = l.added >= BATCH_SAVE_THRESHOLD;
         let prev_ms = LAST_SAVE_MS.load(Ordering::Relaxed);
         if !now && !batch_ready && prev_ms != 0 && now_ms.saturating_sub(prev_ms) < SAVE_EVERY_MS {
-            return;
+            return false;
         }
         LAST_SAVE_MS.store(now_ms, Ordering::Relaxed);
 
@@ -452,7 +475,7 @@ pub fn save(now: bool) {
             }
             Err(e) => {
                 crate::xlog_warn!("D3D12.X: pipeline library serialization failed: {e}");
-                return;
+                return false;
             }
         }
     };
@@ -460,6 +483,7 @@ pub fn save(now: bool) {
     let target = dir.join(LIBRARY_FILE);
     if let Err(e) = std::fs::create_dir_all(dir).and_then(|()| write_atomically(&target, &blob)) {
         crate::xlog_warn!("D3D12.X: saving pipeline library to {} failed: {e}", target.display());
+        false
     } else {
         crate::xlog_info!(
             "D3D12.X: saved pipeline library ({} B, {} graphics loaded, {} compute loaded)",
@@ -467,6 +491,7 @@ pub fn save(now: bool) {
             GRAPHICS_LOADED.load(Ordering::Relaxed),
             COMPUTE_LOADED.load(Ordering::Relaxed)
         );
+        true
     }
 }
 
@@ -679,5 +704,82 @@ mod tests {
         assert!(due(BATCH_SAVE_THRESHOLD, false, 10_000, 10_001));
         assert!(due(1, true, 10_000, 10_001));
         save_async();
+    }
+
+    #[test]
+    fn root_signature_hash_is_stable_across_com_pointers() {
+        use std::ffi::c_void;
+        use std::mem::ManuallyDrop;
+
+        #[repr(C)]
+        struct FakeRootSig {
+            vt: *const usize,
+        }
+        unsafe extern "system" fn add_ref(_this: *mut c_void) -> u32 {
+            1
+        }
+        unsafe extern "system" fn release(_this: *mut c_void) -> u32 {
+            1
+        }
+        let mut vt = [0usize; 4];
+        vt[1] = add_ref as usize;
+        vt[2] = release as usize;
+
+        let mut obj_a = FakeRootSig { vt: vt.as_ptr() };
+        let mut obj_b = FakeRootSig { vt: vt.as_ptr() };
+        let ptr_a = &mut obj_a as *mut _ as usize;
+        let ptr_b = &mut obj_b as *mut _ as usize;
+        assert_ne!(ptr_a, ptr_b);
+
+        const HASH_ONE: u64 = 0x1122_3344_5566_7788;
+        const HASH_TWO: u64 = 0x8877_6655_4433_2211;
+        note_root_signature(ptr_a, HASH_ONE);
+        note_root_signature(ptr_b, HASH_ONE);
+
+        unsafe {
+            let rs_a = ManuallyDrop::new(Some(ID3D12RootSignature::from_raw(ptr_a as *mut c_void)));
+            let rs_b = ManuallyDrop::new(Some(ID3D12RootSignature::from_raw(ptr_b as *mut c_void)));
+
+            let vs = b"dxil_vs_rs_test";
+            let ps = b"dxil_ps_rs_test";
+            let cs = b"dxil_cs_rs_test";
+
+            let gdesc_a = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::ptr::read(&rs_a),
+                ..Default::default()
+            };
+            let gdesc_b = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::ptr::read(&rs_b),
+                ..Default::default()
+            };
+
+            let gp_a = graphics_pso_name(&gdesc_a, vs, Some(ps), None);
+            let gp_b = graphics_pso_name(&gdesc_b, vs, Some(ps), None);
+            assert_eq!(gp_a, gp_b, "same root signature hash at different COM addresses must yield identical graphics PSO names");
+
+            let cdesc_a = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::ptr::read(&rs_a),
+                ..Default::default()
+            };
+            let cdesc_b = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::ptr::read(&rs_b),
+                ..Default::default()
+            };
+
+            let cp_a = compute_pso_name(&cdesc_a, cs);
+            let cp_b = compute_pso_name(&cdesc_b, cs);
+            assert_eq!(cp_a, cp_b, "same root signature hash at different COM addresses must yield identical compute PSO names");
+
+            note_root_signature(ptr_b, HASH_TWO);
+            let gp_b2 = graphics_pso_name(&gdesc_b, vs, Some(ps), None);
+            let cp_b2 = compute_pso_name(&cdesc_b, cs);
+            assert_ne!(gp_a, gp_b2, "distinct root signature hashes must differentiate graphics PSO names");
+            assert_ne!(cp_a, cp_b2, "distinct root signature hashes must differentiate compute PSO names");
+        }
+
+        if let Some(m) = ROOT_SIG_HASHES.lock().unwrap().as_mut() {
+            m.remove(&ptr_a);
+            m.remove(&ptr_b);
+        }
     }
 }

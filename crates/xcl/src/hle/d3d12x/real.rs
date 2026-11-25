@@ -4431,7 +4431,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         let raw = cached_pso.into_raw() as *mut c_void;
         adopt(raw, Kind::PipelineState);
         *ppv = raw;
-        if !chained {
+        if mode != ComputeBuild::Chain {
             let n = TRANSLATED_PSO.load(Ordering::Relaxed);
             if n < 5 || n % 1000 == 0 {
                 crate::xlog_info!("D3D12.X: loaded compute PSO from pipeline library ({pso_name})");
@@ -4494,7 +4494,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         if let Some(pso_ref) = ID3D12PipelineState::from_raw_borrowed(&*ppv) {
-            super::pipeline_library::store_compute(&pso_name, &pso_ref);
+            super::pipeline_library::store_compute(&pso_name, pso_ref);
         }
     }
     (hr, in_driver, reused)
@@ -5286,6 +5286,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         *ppv = raw;
         let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
         note_pso_rs(*ppv, rs);
+        super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
         TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
         note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
         if super::present::trace_frame() {
@@ -5334,7 +5335,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
             } else {
                 pso_name
             };
-            super::pipeline_library::store_graphics(&actual_name, &pso_ref);
+            super::pipeline_library::store_graphics(&actual_name, pso_ref);
         }
     }
     if hr < 0 {
@@ -6899,8 +6900,9 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
         let iid = pc_iid(Kind::RootSignature);
         hr = f(this, mask, blob, len, &iid, ppv);
     }
+    let mut used_fallback = false;
     if hr < 0 {
-        // console root signature rejected → empty one so the title keeps going
+        // console root signature rejected -> empty one so the title keeps going
         let desc = D3D12_ROOT_SIGNATURE_DESC { Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, ..Default::default() };
         let mut ser = None;
         if D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).is_ok() {
@@ -6915,6 +6917,7 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
                     if !ppv.is_null() && !(*ppv).is_null() {
                         super::pipeline_library::note_root_signature(*ppv as usize, 0x5843_4c5f_454d_5054u64);
                     }
+                    used_fallback = true;
                     hr = hr2;
                 }
             }
@@ -6925,7 +6928,9 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
         if !blob.is_null() {
             let bytes = std::slice::from_raw_parts(blob as *const u8, len);
             super::console_list::note_root_signature(*ppv as usize, bytes);
-            super::pipeline_library::note_root_signature(*ppv as usize, crate::gpu::shader::fnv64(bytes));
+            if !used_fallback {
+                super::pipeline_library::note_root_signature(*ppv as usize, crate::gpu::shader::fnv64(bytes));
+            }
         }
     }
     hr
