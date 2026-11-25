@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -279,6 +279,32 @@ pub fn load_graphics(
 static PENDING_ADDED: AtomicU64 = AtomicU64::new(0);
 static LAST_SAVE_MS: AtomicU64 = AtomicU64::new(0);
 static SAVE_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+static BG_SAVING: AtomicBool = AtomicBool::new(false);
+
+const SAVE_EVERY_MS: u64 = 20_000;
+
+fn current_save_ms() -> u64 {
+    SAVE_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+fn due(pending: u64, now: bool, prev_ms: u64, now_ms: u64) -> bool {
+    if pending == 0 {
+        return false;
+    }
+    now || pending >= BATCH_SAVE_THRESHOLD || prev_ms == 0 || now_ms.saturating_sub(prev_ms) >= SAVE_EVERY_MS
+}
+
+fn save_due(now: bool, now_ms: u64) -> bool {
+    if DIR.get().is_none() || library().is_none() {
+        return false;
+    }
+    due(
+        PENDING_ADDED.load(Ordering::Acquire),
+        now,
+        LAST_SAVE_MS.load(Ordering::Relaxed),
+        now_ms,
+    )
+}
 
 fn store_pipeline(name: &str, pso: &ID3D12PipelineState, counter: &AtomicU64) {
     let Some(lib_mutex) = library() else { return };
@@ -349,25 +375,46 @@ pub fn log_summary() {
     );
 }
 
+/// Requests a non-blocking background save when new pipelines are due, so frame
+/// presentation never serializes or writes to disk on the render thread.
+pub fn save_async() {
+    if !save_due(false, current_save_ms()) {
+        return;
+    }
+    if BG_SAVING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("xcl-pso-save".into())
+        .spawn(|| {
+            struct Guard;
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    BG_SAVING.store(false, Ordering::Release);
+                }
+            }
+            let _guard = Guard;
+            save(false);
+        })
+        .is_err()
+    {
+        BG_SAVING.store(false, Ordering::Release);
+    }
+}
+
 /// Serializes and writes the library to disk if new pipelines were stored.
 pub fn save(now: bool) {
     // Serialize-then-write order must remain monotonic so an earlier snapshot cannot overwrite a newer one.
     static SAVE_IO: Mutex<()> = Mutex::new(());
-    const SAVE_EVERY_MS: u64 = 20_000;
 
     if now {
         log_summary();
     }
 
     let (Some(dir), Some(lib_mutex)) = (DIR.get(), library()) else { return };
-    // Avoid blocking frame presentation on SAVE_IO when nothing is pending, within throttle, or busy.
-    let pending = PENDING_ADDED.load(Ordering::Acquire);
-    if pending == 0 {
-        return;
-    }
-    let now_ms = SAVE_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1;
-    let prev_ms = LAST_SAVE_MS.load(Ordering::Relaxed);
-    if !now && pending < BATCH_SAVE_THRESHOLD && prev_ms != 0 && now_ms.saturating_sub(prev_ms) < SAVE_EVERY_MS {
+    // Avoid blocking callers on SAVE_IO when nothing is pending, within throttle, or busy.
+    let now_ms = current_save_ms();
+    if !save_due(now, now_ms) {
         return;
     }
     let _io_guard = if now {
@@ -620,5 +667,17 @@ mod tests {
         desc.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
         let n_empty = graphics_pso_name(&desc, vs, None, None);
         assert_ne!(n_a, n_empty);
+    }
+
+    #[test]
+    fn save_due_respects_pending_and_throttle() {
+        assert!(!due(0, true, 0, 50_000));
+        assert!(!due(0, false, 0, 50_000));
+        assert!(due(1, false, 0, 100));
+        assert!(!due(1, false, 10_000, 29_999));
+        assert!(due(1, false, 10_000, 30_000));
+        assert!(due(BATCH_SAVE_THRESHOLD, false, 10_000, 10_001));
+        assert!(due(1, true, 10_000, 10_001));
+        save_async();
     }
 }

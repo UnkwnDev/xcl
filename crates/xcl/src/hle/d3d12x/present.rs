@@ -1217,7 +1217,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         return;
     }
     p.last = Instant::now();
-    super::pipeline_library::save(false);
+    super::pipeline_library::save_async();
     if !p.dumps.is_empty() {
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
             Ok(()) => {
